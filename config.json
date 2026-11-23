@@ -1,0 +1,127 @@
+{
+  "assistant_name": "Amolex-9026",
+  "user_name": "RK",
+  "audio": {
+    "input_device": "AB13X",
+    "sample_rate": 16000,
+    "block_ms": 30,
+    "gain": 1.0
+  },
+  "wake": {
+    "phrases": ["hey ammo lex", "ammo lex", "hey ammo"],
+    "hotkey": "f8",
+    "barge_in": true,
+    "follow_up_seconds": 8
+  },
+  "fast": {
+    "enabled": true,
+    "fire_on_partial": true,
+    "min_confidence": 0.75,
+    "ignore_chatter": true,
+    "partial_only_when_gaming": true
+  },
+  "speech": {
+    "vosk_model": "vosk-model-small-en-us-0.15",
+    "whisper_model": "small.en",
+    "language": "en",
+    "attentive_timeout_seconds": 6,
+    "end_of_speech_ms": 700,
+    "max_utterance_seconds": 12
+  },
+  "brain": {
+    "provider": "local",
+    "gemini_auth": "api_key",
+    "gemini_model": "gemini-flash-latest",
+    "gemini_models": ["gemini-flash-latest", "gemini-pro-latest"],
+    "oauth_client_secret_file": "client_secret.json",
+    "oauth_scopes": [
+      "https://www.googleapis.com/auth/cloud-platform",
+      "https://www.googleapis.com/auth/generative-language.retriever"
+    ],
+    "oauth_quota_project": null,
+    "local_engine": "ollama",
+    "local_model": "gpt-oss:20b",
+    "local_models": ["gpt-oss:20b"],
+    "routing": {
+      "enabled": true,
+      "light": "gpt-oss:20b",
+      "normal": "gpt-oss:20b",
+      "heavy": "gpt-oss:20b",
+      "gaming_max": "light",
+      "ask_before_heavy": true,
+      "pinned": null,
+      "games": ["valorant.exe", "cs2.exe", "gta5.exe", "eldenring.exe", "cyberpunk2077.exe"],
+      "fullscreen_is_gaming": false,
+      "light_max_words": 8,
+      "heavy_min_words": 30
+    },
+    "ollama_host": "http://127.0.0.1:11434",
+    "local_think": false,
+    "keep_alive": "24h",
+    "heavy_keep_alive": "5m",
+    "load_timeout_seconds": 240,
+    "free_gpu_while_gaming": true,
+    "fallback_to_local": true,
+    "timeout_seconds": 8
+  },
+  "voice": {
+    "online_voice": "en-GB-RyanNeural",
+    "rate": "+0%",
+    "prefer_online": true
+  },
+  "tools": {
+    "apps": {
+      "claude": "%LOCALAPPDATA%\\AnthropicClaude\\claude.exe",
+      "vs code": "code",
+      "chrome": "chrome",
+      "notepad": "notepad.exe",
+      "file explorer": "explorer.exe",
+      "kmplayer": "E:\\KMPlayer 64X\\KMPlayer64.exe"
+    },
+    "player": {
+      "process_names": ["kmplayer64.exe", "kmplayer.exe"],
+      "seek_step_seconds": 5,
+      "default_seek_seconds": 10
+    },
+    "git_repos": {
+      "novara": "D:\\Office\\novara-frontend"
+    },
+    "readable_folders": [
+      "E:\\Amolex",
+      "%USERPROFILE%\\Documents"
+    ],
+    "writable_folders": ["*"],
+    "allow_powershell": true,
+    "search_seconds": 12
+  },
+  "delegates": {
+    "claude": {
+      "enabled": false,
+      "description": "coding, writing and analysis",
+      "command": ["claude", "-p", "{task}"],
+      "stdin": false,
+      "workdir": "E:\\Amolex\\workspace",
+      "timeout_minutes": 30
+    },
+    "gpt": {
+      "enabled": false,
+      "description": "coding and general tasks",
+      "command": ["codex", "exec", "{task}"],
+      "stdin": false,
+      "workdir": "E:\\Amolex\\workspace",
+      "timeout_minutes": 30
+    },
+    "gemini": {
+      "enabled": false,
+      "description": "research and long documents",
+      "command": ["agy", "{task}"],
+      "stdin": false,
+      "workdir": "E:\\Amolex\\workspace",
+      "timeout_minutes": 30
+    }
+  },
+  "jobs": {
+    "results_dir": "E:\\Amolex\\jobs",
+    "max_parallel": 2
+  }
+}

@@ -1,0 +1,41 @@
+[project]
+name = "amolex"
+version = "0.1.0"
+description = "Amolex-9026: a voice-controlled desktop assistant for Windows"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # audio in
+    "sounddevice>=0.4.7",
+    "numpy>=1.26",
+    "webrtcvad-wheels>=2.0.14",
+    # speech recognition
+    "vosk>=0.3.45",
+    "faster-whisper>=1.0.3",
+    # AI
+    "google-genai>=1.0.0",
+    "google-auth-oauthlib>=1.2.0",
+    "ollama>=0.4.0",
+    # input injection + hotkey
+    "pydirectinput>=1.0.4",
+    "pyautogui>=0.9.54",
+    "keyboard>=0.13.5",
+    # voice out
+    "edge-tts>=6.1.12",
+    "miniaudio>=1.59",
+    "pyttsx3>=2.90",
+    # app support
+    "pydantic>=2.7",
+    "keyring>=25.0",
+    "pystray>=0.19.5",
+    "pillow>=10.3",
+    "psutil>=5.9",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.2"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

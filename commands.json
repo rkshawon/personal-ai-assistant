@@ -1,0 +1,25 @@
+{
+  "_help": "Fast commands. 'phrase' is what you say (lowercase, words only). Actions: click (button), key (key, optional hold_ms), hotkey (keys list), scroll (amount: + up, - down). Every word must exist in the Vosk model; run 'start.bat --doctor' to check.",
+  "commands": [
+    { "phrase": "shoot",          "action": "click",  "button": "left" },
+    { "phrase": "aim",            "action": "click",  "button": "right" },
+    { "phrase": "reload",         "action": "key",    "key": "r" },
+    { "phrase": "jump",           "action": "key",    "key": "space" },
+    { "phrase": "crouch",         "action": "key",    "key": "ctrl" },
+    { "phrase": "press w",        "action": "key",    "key": "w", "hold_ms": 600 },
+    { "phrase": "press a",        "action": "key",    "key": "a", "hold_ms": 400 },
+    { "phrase": "press s",        "action": "key",    "key": "s", "hold_ms": 400 },
+    { "phrase": "press d",        "action": "key",    "key": "d", "hold_ms": 400 },
+    { "phrase": "next reel",      "action": "key",    "key": "down" },
+    { "phrase": "previous reel",  "action": "key",    "key": "up" },
+    { "phrase": "scroll down",    "action": "scroll", "amount": -5 },
+    { "phrase": "scroll up",      "action": "scroll", "amount": 5 },
+    { "phrase": "pause",          "action": "key",    "key": "space" },
+    { "phrase": "volume up",      "action": "key",    "key": "volumeup" },
+    { "phrase": "volume down",    "action": "key",    "key": "volumedown" }
+  ],
+  "control": {
+    "standby": ["standby", "go to standby", "sleep"],
+    "stop": ["stop", "cancel"]
+  }
+}
