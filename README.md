@@ -56,6 +56,22 @@ No Gemini key is needed: the brain is local. (Gemini via API key is still option
   in any app, open and switch apps, type into them ("open Notepad and write Hello World"), press
   shortcuts ("press ctrl+s in Notepad"), create and edit text files, make and list folders, move or
   rename files, send files to the Recycle Bin, and run PowerShell for anything else.
+- **Reading the screen:** "what's on my screen?", "close that", "read this to me". It reads the window
+  in front as text, like Windows' Narrator does (title, buttons, menus, labels, text in documents and
+  web pages), and lists open windows, so "this" and "that" make sense to it. It can't see pictures,
+  video or games. Apps running as administrator (Task Manager) can only be read or closed if Amolex
+  also runs as administrator.
+- **Closing apps with unsaved work:** "close Notepad" closes it like clicking X. If it asks to save,
+  Amolex asks you "save, don't save, or cancel?" and presses that button (with the `uiautomation`
+  package, installed automatically on the next start). A new, never-saved file opens Save As: pick
+  the name on screen. "Force close Notepad" ends it without asking the app, after your yes.
+- **Long tasks:** if a task is still running after 3 s (`speech.slow_notice_seconds`; time spent
+  waiting for your yes/no doesn't count), it says "This will take a moment. I'll tell you when it's
+  done." and ends its reply with "The task is done." (not when it failed or you cancelled).
+- **Names don't have to be exact.** Files and apps are matched loosely ("black cover" finds Black
+  Clover, "game player" finds KMPlayer). A single clear match is used straight away; a close-but-not-exact
+  match or several matches are checked with you first ("I found 4 matches. Do you mean Black Clover
+  S2 175?"). Say no and it lists the others instead of guessing.
 - **Permission rule:** opening, searching, reading, typing, creating new files and folders, and
   look-only commands (IP address, disk space, running programs) just happen. Editing, adding to,
   replacing, moving or renaming existing files, sending them to the Recycle Bin, and any command that
@@ -169,5 +185,3 @@ If Gemini fails, the local brain answers instead.
 E:\ProgramData\Amolex\uv\uv.exe run --project E:\Amolex pytest
 ```
 Logs: `E:\Amolex\logs\amolex.log` (includes per-stage timings).
-#   p e r s o n a l - a i - a s s i s t a n t  
- 

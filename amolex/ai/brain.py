@@ -50,8 +50,16 @@ def system_prompt(cfg: Config) -> str:
         "or details you can find yourself. The tools ask the user's permission themselves before editing "
         "or deleting anything, so never refuse for that reason. For a multi-step request, call the tools one "
         "after another until it's all done (e.g. find_files, then open_file with app set; or open_app, then "
-        "type_text). If find_files returns several matches, pick the best one (the lowest episode number "
-        "if none was named) and say which. You cannot see the screen. Never claim you did something unless "
+        "type_text). Names the user says are often misheard or partial: pass them as said. When the user "
+        "wants one file to act on (play, open, move, recycle), call find_files with pick_one=true: it checks "
+        "with the user when the match isn't exact or there are several, so use only the path it returns, "
+        "and never act on a file the user said was wrong. If a request names something but no clear action "
+        "(just 'KMPlayer'), ask what to do instead of guessing. Tools that ask the user something (close_app, "
+        "find_files) already have the answer when they return: never call them again for the same thing. "
+        "You can read the screen as text with read_screen (the window in front) and list_open_windows: "
+        "when the user says 'this', 'that', 'it', 'the other one' or refers to something they're looking at, "
+        "read the screen first and use it to work out what they mean, then act. Pictures, video and games "
+        "have no readable text. Never claim you did something unless "
         "a tool confirmed it; if no tool fits, say plainly that you can't do that yet."
     )
 

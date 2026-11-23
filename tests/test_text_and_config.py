@@ -95,6 +95,44 @@ def test_follow_up_window(monkeypatch):
         assert said[-1] == ("Yes, RK?", State.ATTENTIVE)
 
 
+def test_slow_tasks_are_announced(monkeypatch):
+    import sys
+    import threading
+    import time
+    import types
+
+    for m in ("sounddevice", "numpy", "pyautogui", "pydirectinput", "psutil", "vosk", "webrtcvad"):
+        monkeypatch.setitem(sys.modules, m, sys.modules.get(m) or types.ModuleType(m))
+    v = sys.modules["vosk"]
+    if not hasattr(v, "Model"):
+        v.KaldiRecognizer = v.Model = object
+        v.SetLogLevel = lambda *a: None
+    from amolex.app import App
+    from amolex.speech.text import task_succeeded
+
+    spoken = []
+    app = App.__new__(App)
+    app.cfg = Config()
+    app.cfg.speech.slow_notice_seconds = 0.3
+    app._awaiting_confirm, app._reset_endpointer, app._voice = threading.Event(), threading.Event(), threading.Lock()
+    app.speaker = types.SimpleNamespace(speaking=False, say=lambda text, **k: spoken.append(text) or True)
+
+    result, told = app._with_slow_notice(lambda: "quick")  # fast: nothing said
+    assert (result, told) == ("quick", False) and not spoken
+    result, told = app._with_slow_notice(lambda: time.sleep(0.8) or "slow")
+    assert told and spoken == ["This will take a moment. I'll tell you when it's done."]
+
+    spoken.clear()  # time spent waiting for a yes/no doesn't count as slow work
+    app._awaiting_confirm.set()
+    _, told = app._with_slow_notice(lambda: time.sleep(0.8))
+    assert not told and not spoken
+
+    assert task_succeeded("Opened Black Clover S2 175 in kmplayer.")
+    for reply in ("Cancelled. Nothing moved.", "Sorry, the model is taking too long.", "kmplayer isn't running.",
+                  "I couldn't find black cover exactly.", "Which one do you mean?", "I can’t type into the app."):
+        assert not task_succeeded(reply), reply
+
+
 def test_instant_commands_skip_the_ai():
     from amolex.ai.intents import handle
 
@@ -230,9 +268,12 @@ def test_search_and_permissions(tmp_path):
     (tmp_path / "E" / "node_modules").mkdir()
     (tmp_path / "E" / "node_modules" / "black-clover.mp4").write_text("x")  # skipped folder
     hits, finished = search_files("black clover", [tmp_path / "E"], seconds=5, kind="video")
-    assert finished and sorted(h.name for h in hits) == ["Black.Clover.E01.mkv", "Black.Clover.E02.mkv"]
+    assert finished and [(h.name, s) for h, s in hits] == [("Black.Clover.E01.mkv", 1.0), ("Black.Clover.E02.mkv", 1.0)]
     hits, _ = search_files("black clover", [tmp_path / "E"], seconds=5)  # no kind: the folder counts too
-    assert any(h.name == "Black Clover" for h in hits)
+    assert any(h.name == "Black Clover" for h, _ in hits)
+    # from RK's log: Whisper heard "Black Cover": found as a close (not exact) match
+    hits, _ = search_files("black cover", [tmp_path / "E"], seconds=5, kind="video")
+    assert hits and all(0.75 <= s < 1.0 for _, s in hits) and hits[0][0].name == "Black.Clover.E01.mkv"
 
     # look-only commands just run; anything that changes something asks first
     for cmd in ("Get-NetIPAddress -AddressFamily IPv4 | Select-Object IPAddress", "ipconfig",
@@ -243,6 +284,176 @@ def test_search_and_permissions(tmp_path):
                 "Get-Process notepad | Stop-Process", "Get-Content a.txt > b.txt", "netsh wlan show profiles",
                 "notepad.exe", "Start-Process chrome"):
         assert powershell_needs_permission(cmd), cmd
+
+
+def test_unsure_matches_are_confirmed(tmp_path):
+    from amolex.ai import tools as tools_mod
+    from amolex.ai.jobs import JobManager
+    from amolex.config import JobsCfg, ToolsCfg
+
+    anime = tmp_path / "Anime"
+    anime.mkdir()
+    for n in ("[SubsPlease] Black Clover S2 - 176 (1080p).mkv", "[SubsPlease] Black Clover S2 - 175 (1080p).mkv",
+              "One Piece 1000.mkv"):
+        (anime / n).write_text("x")
+    asked, answers = [], []
+    t = {f.__name__: f for f in tools_mod.build_tools(
+        ToolsCfg(apps={"kmplayer": "x.exe", "notepad": "notepad.exe"}),
+        confirm=lambda q: (asked.append(q), answers.pop(0))[1], notify=lambda m: None,
+        jobs=JobManager({}, JobsCfg(), lambda m: None))}
+    find = lambda name, **k: t["find_files"](name, folder=str(anime), pick_one=True, **k)  # noqa: E731
+
+    # one clear match: no question
+    assert find("one piece").startswith("Use this file:") and not asked
+    # misheard ("black cover"): asks about the closest, in plain words
+    answers.append(True)
+    out = find("black cover")
+    assert asked[-1] == "I couldn't find black cover exactly. The closest is Black Clover S2 175. Is that it?"
+    assert "confirmed" in out and "175" in out
+    # several matches: asks about the first episode; "no" lists the others instead of guessing
+    answers.append(False)
+    out = find("black clover")
+    assert asked[-1] == "I found 2 matches. Do you mean Black Clover S2 175?"
+    assert "not the one" in out and "Black Clover S2 176" in out
+    # apps: a misheard name is checked, not refused or guessed
+    answers.append(False)
+    assert "not in my app list" in t["open_app"]("note bad")
+    assert asked[-1] == "I don't have note bad. Did you mean notepad?"
+    assert tools_mod.closest_name("game player", ["KMPlayer64", "chrome", "Code"]) == "KMPlayer64"
+    assert tools_mod.closest_name("spotify", ["KMPlayer64", "chrome"]) is None
+
+
+def test_save_prompt_answers():
+    from amolex.ai.tools import SAVE_CHOICES, save_prompt_role
+    from amolex.speech.text import pick_option, task_succeeded
+
+    # Windows 11 Notepad, classic dialogs (& marks the shortcut letter), and Yes/No/Cancel boxes
+    assert [save_prompt_role(n) for n in ("Save", "Don't save", "Cancel")] == ["save", "dont_save", "cancel"]
+    assert [save_prompt_role(n) for n in ("&Save", "Do&n't Save", "Don’t save")] == ["save", "dont_save", "dont_save"]
+    assert [save_prompt_role(n) for n in ("Yes", "No")] == ["save", "dont_save"]
+    assert save_prompt_role("Save as") is None and save_prompt_role("File") is None
+
+    # what RK might say; "don't save" must not be read as "save"
+    for said, want in {"Don't save.": "dont_save", "Don’t save it": "dont_save", "Save it.": "save",
+                       "Yes, save.": "save", "No.": "dont_save", "Cancel.": "cancel",
+                       "Leave it, never mind": "cancel", "discard": "dont_save", "what?": None, "": None}.items():
+        assert pick_option(said, SAVE_CHOICES) == want, said
+
+    assert task_succeeded("Closed Notepad without saving.")
+    assert not task_succeeded("Okay, I left Notepad open.")
+    assert not task_succeeded("Notepad is asking where to save it. Pick a name and folder on screen, and it will close.")
+
+
+def test_close_answers_the_save_prompt(monkeypatch):
+    import types
+
+    import psutil
+
+    from amolex.ai import tools as tools_mod
+    from amolex.ai.jobs import JobManager
+    from amolex.config import JobsCfg, ToolsCfg
+
+    # a fake Notepad: closing it raises "Save / Don't save / Cancel" until one is pressed
+    state = {"open": True, "prompts": 0, "pressed": []}
+    monkeypatch.setattr(tools_mod, "find_windows_by_name", lambda n: [(101, 4242)] if state["open"] else [])
+    monkeypatch.setattr(tools_mod, "_process_matches", lambda pid, n: True)
+    monkeypatch.setattr(tools_mod, "ctypes", types.SimpleNamespace(
+        windll=types.SimpleNamespace(user32=types.SimpleNamespace(PostMessageW=lambda *a: 1))))
+    monkeypatch.setattr(tools_mod.time, "sleep", lambda s: None)
+    monkeypatch.setattr(psutil, "process_iter", lambda attrs=None: [])
+    monkeypatch.setattr(psutil, "pid_exists", lambda pid: state["open"])
+
+    def fake_prompt(hwnds, decide):
+        state["prompts"] += 1
+        choice = decide()
+        if choice in ("save", "dont_save"):
+            state["pressed"].append(choice)
+            state["open"] = False
+        return "unanswered" if choice is None else choice
+
+    monkeypatch.setattr(tools_mod, "answer_save_prompt", fake_prompt)
+    answers, asked = [], []
+
+    def choose(question, options):
+        asked.append(question)
+        return answers.pop(0)
+
+    t = {f.__name__: f for f in tools_mod.build_tools(
+        ToolsCfg(), confirm=lambda q: True, notify=lambda m: None, jobs=JobManager({}, JobsCfg(), lambda m: None),
+        choose=choose)}
+
+    answers.append("dont_save")  # RK's case: Notepad asked to save; Amolex asks him, then presses it
+    assert t["close_app"]("notepad") == "Closed notepad without saving."
+    assert asked == ["notepad wants to know whether to save your changes. Say save, don't save, or cancel."]
+    assert state["pressed"] == ["dont_save"]
+
+    state.update(open=True)
+    answers.append("cancel")
+    assert t["close_app"]("notepad") == "Okay, I left notepad open." and state["open"]
+
+    answers.append(None)  # no answer: nothing is pressed, and it says so
+    assert "didn't catch an answer" in t["close_app"]("notepad") and state["open"]
+
+
+def test_answers_ignore_its_own_echo(monkeypatch):
+    import queue
+    import sys
+    import threading
+    import types
+
+    for m in ("sounddevice", "numpy", "pyautogui", "pydirectinput", "psutil", "vosk", "webrtcvad"):
+        monkeypatch.setitem(sys.modules, m, sys.modules.get(m) or types.ModuleType(m))
+    v = sys.modules["vosk"]
+    if not hasattr(v, "Model"):
+        v.KaldiRecognizer = v.Model = object
+        v.SetLogLevel = lambda *a: None
+    from amolex.app import App
+    from amolex.state import State, StateMachine
+
+    app = App.__new__(App)
+    app.confirm_replies = queue.Queue()
+    app._awaiting_confirm, app._reset_endpointer, app._voice = threading.Event(), threading.Event(), threading.Lock()
+    app.sm = StateMachine(State.THINKING)
+    # from RK's log: the tail of its own question came back as '' and was taken as "no", three times
+    app.speaker = types.SimpleNamespace(say=lambda text, **k: [app.confirm_replies.put(r) for r in ("", "")] and True)
+    threading.Timer(0.2, lambda: (app.confirm_replies.put(""), app.confirm_replies.put("Yes."))).start()
+    assert app.confirm("Did you mean Taskmgr?") is True
+
+
+def test_read_screen(monkeypatch):
+    from amolex.ai import tools as tools_mod
+    from amolex.ai.jobs import JobManager
+    from amolex.config import JobsCfg, ToolsCfg
+
+    monkeypatch.setattr(tools_mod, "list_windows", lambda: [
+        (1, "Untitled - Notepad", "Notepad"), (2, "Black Clover S2 175", "KMPlayer64"), (3, "YouTube - Chrome", "chrome")])
+    monkeypatch.setattr(tools_mod, "read_window_text",
+                        lambda hwnd, **k: {1: "document: Hello World\nmenu: File", 2: ""}.get(hwnd, ""))
+    monkeypatch.setattr(tools_mod, "find_window_by_name", lambda app: 2 if "km" in app else None)
+    t = {f.__name__: f for f in tools_mod.build_tools(
+        ToolsCfg(), confirm=lambda q: True, notify=lambda m: None, jobs=JobManager({}, JobsCfg(), lambda m: None))}
+
+    out = t["read_screen"]()
+    assert out.startswith("In front: Untitled - Notepad (Notepad).") and "document: Hello World" in out
+    assert "Other open windows: Black Clover S2 175; YouTube - Chrome" in out
+    assert "no readable text" in t["read_screen"]("kmplayer")  # video: nothing to read, and it says so
+    assert "can't find an open zoom window" in t["read_screen"]("zoom")
+    assert t["list_open_windows"]().startswith("Open windows, front first: Untitled - Notepad (Notepad);")
+
+
+def test_app_name_matching():
+    from amolex.ai.tools import app_matches
+
+    assert app_matches("task manager", "Taskmgr.exe") and app_matches("Task Manager", "Taskmgr.exe")
+    assert app_matches("calculator", "CalculatorApp.exe") and app_matches("edge", "msedge.exe")
+
+    # from RK's log: "close KMPlayer" said it wasn't running; the process is KMPlayer64.exe
+    assert app_matches("kmplayer", "KMPlayer64.exe") and app_matches("KMPlayer.exe", "KMPlayer64.exe")
+    assert app_matches("km player", "KMPlayer64.exe")
+    assert app_matches("vs code", "Code.exe") and app_matches("notepad", "Notepad.exe")
+    assert app_matches("file explorer", "explorer.exe") and app_matches("chrome", "chrome.exe")
+    assert not app_matches("a", "Notepad.exe")  # too short to mean anything: would match everything
+    assert not app_matches("chrome", "Code.exe")
 
 
 def test_kmplayer_commands():

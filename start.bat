@@ -18,6 +18,15 @@ if not exist "%PY%" (
     )
 )
 
+rem Pick up packages that updates added (about a second when nothing changed; skipped if offline)
+set "UV_PYTHON_INSTALL_DIR=%AMOLEX_HOME%\python"
+set "UV_PYTHON_PREFERENCE=only-managed"
+set "UV_CACHE_DIR=%AMOLEX_HOME%\cache\uv"
+set "UV_PROJECT_ENVIRONMENT=%AMOLEX_HOME%\venv"
+if exist "%AMOLEX_HOME%\uv\uv.exe" (
+    "%AMOLEX_HOME%\uv\uv.exe" sync --quiet --project "%~dp0." --python 3.12 || echo Package update skipped; continuing.
+)
+
 rem Start the local AI server in the background if it is installed and not running
 if exist "%AMOLEX_HOME%\ollama\ollama.exe" (
     tasklist /FI "IMAGENAME eq ollama.exe" | find /I "ollama.exe" >nul || start "" /MIN "%AMOLEX_HOME%\ollama\ollama.exe" serve

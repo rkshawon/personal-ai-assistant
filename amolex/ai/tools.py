@@ -32,6 +32,14 @@ log = logging.getLogger(__name__)
 
 Confirm = Callable[[str], bool]
 Notify = Callable[[str], None]
+# Ask a question with several spoken answers: choose(question, {"key": ["phrase", ...]}) -> key or None
+Choose = Callable[[str, dict[str, list[str]]], "str | None"]
+
+SAVE_CHOICES = {
+    "dont_save": ["don't save", "dont save", "do not save", "discard", "don't", "no", "throw it away"],
+    "cancel": ["cancel", "keep it open", "leave it", "never mind", "stop", "wait"],
+    "save": ["save", "yes", "save it", "keep the changes"],
+}
 
 SETTINGS_PAGES = {
     "display": "ms-settings:display",
@@ -205,49 +213,297 @@ def focus_window(hwnd: int) -> bool:
     return user32.GetForegroundWindow() == hwnd
 
 
-def find_window_by_name(name: str) -> int | None:
-    """The front-most window of an app by its spoken name: "notepad", "vs code", "kmplayer", "chrome".
+# What common Windows apps are really called: "task manager" runs as Taskmgr.exe
+WINDOWS_APPS = {
+    "taskmanager": "taskmgr", "calculator": "calculatorapp", "paint": "mspaint", "commandprompt": "cmd",
+    "cmd": "cmd", "powershell": "powershell", "terminal": "windowsterminal", "windowsterminal": "windowsterminal",
+    "controlpanel": "control", "settings": "systemsettings", "edge": "msedge", "microsoftedge": "msedge",
+    "word": "winword", "excel": "excel", "powerpoint": "powerpnt", "visualstudiocode": "code", "vscode": "code",
+    "fileexplorer": "explorer", "photos": "photos", "snippingtool": "snippingtool", "spotify": "spotify",
+}
+# How to open them when they aren't in config.json's app list
+WINDOWS_APP_COMMANDS = {
+    "taskmgr": "taskmgr.exe", "calculatorapp": "calc.exe", "mspaint": "mspaint.exe", "cmd": "cmd.exe",
+    "powershell": "powershell.exe", "windowsterminal": "wt.exe", "control": "control.exe",
+    "systemsettings": "ms-settings:", "msedge": "msedge.exe", "snippingtool": "snippingtool.exe",
+}
+
+
+def app_matches(spoken: str, exe_name: str) -> bool:
+    """'kmplayer' matches KMPlayer64.exe, 'vs code' matches Code.exe, 'task manager' Taskmgr.exe."""
+    needle = re.sub(r"[^a-z0-9]", "", spoken.lower().removesuffix(".exe"))
+    needle = WINDOWS_APPS.get(needle, needle)
+    exe = re.sub(r"[^a-z0-9]", "", exe_name.lower().removesuffix(".exe"))
+    return len(needle) >= 3 and len(exe) >= 3 and (needle in exe or exe in needle)
+
+
+# The desktop and taskbar belong to explorer.exe too; sending them "close" opens the shut-down dialog
+_SHELL_CLASSES = {"progman", "shell_traywnd", "shell_secondarytraywnd", "workerw"}
+
+
+def find_windows_by_name(name: str) -> list[tuple[int, int]]:
+    """Every visible window of an app by its spoken name, front-most first, as (window, process id).
 
     Matches the program's file name first (Notepad.exe, Code.exe, KMPlayer64.exe), then the window title.
     """
     if os.name != "nt":
-        return None
+        return []
     import psutil
     from ctypes import wintypes
 
     needle = re.sub(r"[^a-z0-9]", "", name.lower())
     if not needle:
-        return None
+        return []
     user32 = _user32()
     user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
     names: dict[int, str] = {}
-    by_process: list[int] = []
-    by_title: list[int] = []
+    by_process: list[tuple[int, int]] = []
+    by_title: list[tuple[int, int]] = []
+    me = os.getpid()
 
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     def each(hwnd, _):
         length = user32.GetWindowTextLengthW(hwnd)
         if not length or not user32.IsWindowVisible(hwnd):
             return True
+        cls = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(hwnd, cls, 64)
+        if cls.value.lower() in _SHELL_CLASSES:
+            return True
         pid = wintypes.DWORD()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value == me:
+            return True
         if pid.value not in names:
             try:
-                names[pid.value] = re.sub(r"[^a-z0-9]", "", psutil.Process(pid.value).name().lower().removesuffix(".exe"))
+                names[pid.value] = psutil.Process(pid.value).name()
             except psutil.Error:
                 names[pid.value] = ""
-        exe = names[pid.value]
         buf = ctypes.create_unicode_buffer(length + 1)
         user32.GetWindowTextW(hwnd, buf, length + 1)
         title = re.sub(r"[^a-z0-9]", "", buf.value.lower())
-        if exe and len(exe) >= 3 and (needle in exe or exe in needle):
-            by_process.append(hwnd)
+        if app_matches(name, names[pid.value]):
+            by_process.append((hwnd, pid.value))
         elif needle in title:
-            by_title.append(hwnd)
+            by_title.append((hwnd, pid.value))
         return True
 
     user32.EnumWindows(each, 0)
-    return (by_process or by_title or [None])[0]
+    return by_process or by_title
+
+
+def find_window_by_name(name: str) -> int | None:
+    """The front-most window of an app by its spoken name: "notepad", "vs code", "kmplayer", "chrome"."""
+    found = find_windows_by_name(name)
+    return found[0][0] if found else None
+
+
+def closest_name(spoken: str, choices: list[str]) -> str | None:
+    """The choice that sounds closest to what was said: 'game player' -> 'kmplayer', 'note pad' -> 'notepad'."""
+    import difflib
+
+    squash = lambda s: re.sub(r"[^a-z0-9]", "", s.lower().removesuffix(".exe"))  # noqa: E731
+    wanted = squash(spoken)
+    if not wanted:
+        return None
+    scored = [(difflib.SequenceMatcher(None, wanted, squash(c)).ratio(), c) for c in choices if squash(c)]
+    best = max(scored, default=(0.0, None))
+    return best[1] if best[0] >= 0.6 else None
+
+
+def running_app_names() -> list[str]:
+    """Programs that have a window open right now, e.g. ['KMPlayer64', 'chrome', 'Code']."""
+    if os.name != "nt":
+        return []
+    import psutil
+    from ctypes import wintypes
+
+    user32 = _user32()
+    pids: set[int] = set()
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def each(hwnd, _):
+        if user32.IsWindowVisible(hwnd) and user32.GetWindowTextLengthW(hwnd):
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            pids.add(pid.value)
+        return True
+
+    user32.EnumWindows(each, 0)
+    names = set()
+    for pid in pids - {os.getpid()}:
+        try:
+            names.add(psutil.Process(pid).name().removesuffix(".exe"))
+        except psutil.Error:
+            pass
+    return sorted(names - {"explorer", "ApplicationFrameHost", "TextInputHost", "SystemSettings"})
+
+
+def _amolex_console() -> int:
+    """The console window Amolex runs in (it's in front whenever you just used it; skip it)."""
+    try:
+        return ctypes.windll.kernel32.GetConsoleWindow() or 0  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        return 0
+
+
+def list_windows() -> list[tuple[int, str, str]]:
+    """Visible app windows, front-most first, as (handle, title, program) - not Amolex's own console."""
+    if os.name != "nt":
+        return []
+    import psutil
+    from ctypes import wintypes
+
+    user32 = _user32()
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    console, me = _amolex_console(), os.getpid()
+    found: list[tuple[int, str, str]] = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def each(hwnd, _):
+        length = user32.GetWindowTextLengthW(hwnd)
+        if not length or not user32.IsWindowVisible(hwnd) or hwnd == console:
+            return True  # untitled, hidden, or Amolex's own console
+        cls = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(hwnd, cls, 64)
+        if cls.value.lower() in _SHELL_CLASSES:
+            return True
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value == me:
+            return True
+        title = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, title, length + 1)
+        try:
+            program = psutil.Process(pid.value).name().removesuffix(".exe")
+        except psutil.Error:
+            program = ""
+        if "start.bat" in title.value.lower() or "\\amolex" in title.value.lower():
+            return True  # the terminal running Amolex
+        found.append((hwnd, title.value, program))
+        return True
+
+    user32.EnumWindows(each, 0)
+    return found
+
+
+_UIA_LABELS = {
+    "ButtonControl": "button", "TextControl": "", "EditControl": "text box", "DocumentControl": "document",
+    "MenuItemControl": "menu", "TabItemControl": "tab", "ListItemControl": "item", "HyperlinkControl": "link",
+    "CheckBoxControl": "checkbox", "ComboBoxControl": "dropdown", "TreeItemControl": "item",
+    "HeaderItemControl": "column", "DataItemControl": "cell", "TitleBarControl": "",
+}
+
+
+def read_window_text(hwnd: int, max_chars: int = 3000, seconds: float = 4) -> str:
+    """The text a screen reader would read in a window: labels, buttons, tabs, and what's typed in
+    documents and boxes. Pictures, video and games have no text to read."""
+    try:
+        import uiautomation as auto
+    except ImportError:
+        return "I can't read windows: the uiautomation package isn't installed yet. Restart Amolex once."
+    lines: list[str] = []
+    seen: set[str] = set()
+    size = 0
+    deadline = time.monotonic() + seconds
+    with auto.UIAutomationInitializerInThread():
+        top = auto.ControlFromHandle(hwnd)
+        if top is None:
+            return ""
+        for control, _depth in auto.WalkControl(top, maxDepth=30):
+            if time.monotonic() > deadline or size > max_chars:
+                break
+            kind = control.ControlTypeName
+            if kind not in _UIA_LABELS:
+                continue
+            try:
+                if control.IsOffscreen:
+                    continue
+                text = ""
+                if kind in ("EditControl", "DocumentControl"):
+                    try:
+                        text = control.GetValuePattern().Value
+                    except Exception:
+                        try:
+                            text = control.GetTextPattern().DocumentRange.GetText(max_chars)
+                        except Exception:
+                            text = ""
+                text = re.sub(r"\s+", " ", (text or control.Name or "")).strip()
+            except Exception:  # controls can vanish while we read them
+                continue
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            label = _UIA_LABELS[kind]
+            line = f"{label}: {text}" if label else text
+            lines.append(line)
+            size += len(line)
+    out = "\n".join(lines)
+    return out[:max_chars] + (" [more not read]" if len(out) > max_chars else "")
+
+
+def save_prompt_role(button_name: str) -> str | None:
+    """What a button in a "save your changes?" prompt does: Notepad's "Save" / "Don't save" /
+    "Cancel", classic "&Save" / "Do&n't Save", or a Yes / No / Cancel box."""
+    n = re.sub(r"\s+", " ", button_name.replace("&", "").replace("’", "'").strip().lower())
+    if n in {"don't save", "dont save", "do not save", "no", "discard", "discard changes", "close without saving",
+             "don't save changes"}:
+        return "dont_save"
+    if n in {"save", "save changes", "yes", "save all"}:
+        return "save"
+    if n == "cancel":
+        return "cancel"
+    return None
+
+
+def answer_save_prompt(hwnds: list[int], decide: Callable[[], str | None]) -> str | None:
+    """If one of these windows shows a "save your changes?" prompt, ask decide() what to do and press
+    that button. Returns the choice ('save' / 'dont_save' / 'cancel'), 'unanswered' if decide() gave
+    nothing (no button is pressed then), or None if there's no such prompt or it can't be read."""
+    if os.name != "nt":
+        return None
+    try:
+        import uiautomation as auto
+    except ImportError:
+        log.warning("uiautomation isn't installed, so I can't read other apps' buttons")
+        return None
+    with auto.UIAutomationInitializerInThread():
+        buttons: dict[str, object] = {}
+        deadline = time.monotonic() + 4  # big windows (Chrome) have huge trees: don't walk them forever
+        for hwnd in hwnds:
+            top = auto.ControlFromHandle(hwnd)
+            if top is None:
+                continue
+            found: dict[str, object] = {}
+            for control, _depth in auto.WalkControl(top, maxDepth=15):
+                if control.ControlTypeName == "ButtonControl":
+                    role = save_prompt_role(control.Name or "")
+                    if role and role not in found:
+                        found[role] = control
+                if time.monotonic() > deadline:
+                    break
+            if "save" in found and "dont_save" in found:  # both, or it isn't a save prompt
+                buttons = found
+                break
+        if not buttons:
+            return None
+        choice = decide()
+        if choice not in buttons:
+            return "unanswered" if choice is None else choice
+        buttons[choice].GetInvokePattern().Invoke()  # type: ignore[attr-defined]
+        return choice
+
+
+def _process_matches(pid: int, name: str) -> bool:
+    """Closing only targets the app's own process, never a window that just has the name in its title."""
+    import psutil
+
+    try:
+        return app_matches(name, psutil.Process(pid).name())
+    except psutil.Error:
+        return False
 
 
 def get_clipboard() -> str | None:
@@ -411,6 +667,40 @@ def name_matches(file_name: str, query: str) -> bool:
     return all(w in hay or w in joined for w in _norm(query).split())
 
 
+FUZZY_MIN = 0.75  # every spoken word must be at least this close to a word in the name
+
+
+def match_score(file_name: str, query: str) -> float:
+    """1.0 for a real match; 0.75-0.99 when the name is close ('black cover' vs Black.Clover, as
+    Whisper heard it on RK's PC); 0 otherwise. Close matches are confirmed with the user first."""
+    if name_matches(file_name, query):
+        return 1.0
+    import difflib
+
+    tokens = _norm(os.path.splitext(file_name)[0]).split()
+    words = _norm(query).split()
+    if not tokens or not words:
+        return 0.0
+    sims = [max(difflib.SequenceMatcher(None, w, t).ratio() for t in tokens) for w in words]
+    return min(0.99, sum(sims) / len(sims)) if min(sims) >= FUZZY_MIN else 0.0
+
+
+def pretty_name(path: Path | str) -> str:
+    """How to say a file's name: '[SubsPlease] Black Clover S2 - 175 (1080p) [19BCC639].mkv.mp4'
+    -> 'Black Clover S2 175'."""
+    name = Path(path).name
+    while os.path.splitext(name)[1] and len(os.path.splitext(name)[1]) <= 5:
+        name = os.path.splitext(name)[0]
+    name = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", name)
+    name = re.sub(r"[._\-]+", " ", name)
+    return re.sub(r"\s+", " ", name).strip() or Path(path).name
+
+
+def natural_key(path: Path) -> list:
+    """Episode 2 before episode 10."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", path.name)]
+
+
 def fixed_drives() -> list[Path]:
     """Your hard drives and SSDs (C:, D:, E:...), not DVD or network drives."""
     if os.name != "nt":
@@ -426,13 +716,26 @@ def fixed_drives() -> list[Path]:
     return drives
 
 
-def search_files(query: str, roots: list[Path], seconds: float, kind: str = "", limit: int = 10) -> tuple[list[Path], bool]:
-    """Find files and folders whose names contain all the words, walking roots in order.
-    Returns (matches, finished): finished is False if it ran out of time."""
+def search_files(
+    query: str, roots: list[Path], seconds: float, kind: str = "", limit: int = 10
+) -> tuple[list[tuple[Path, float]], bool]:
+    """Find files and folders named like the query, walking roots in order.
+
+    Returns ([(path, score)], finished): real matches (score 1.0) first, in episode order, then close
+    ones, best first. finished is False if it ran out of time.
+    """
     exts = KINDS.get(kind.lower().strip().rstrip("s"), set()) if kind else set()
+    words = _norm(query).split()
     deadline = time.monotonic() + seconds
-    hits: list[Path] = []
+    exact: list[Path] = []
+    close: list[tuple[Path, float]] = []
     seen: set[str] = set()
+    finished = True
+
+    def result():
+        ranked_close = sorted(close, key=lambda c: (-c[1], natural_key(c[0])))[:limit]  # equal: episode order
+        return [(p, 1.0) for p in sorted(exact, key=natural_key)[:limit]] + ranked_close
+
     for root in roots:
         for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
             key = os.path.normcase(dirpath)
@@ -445,12 +748,19 @@ def search_files(query: str, roots: list[Path], seconds: float, kind: str = "", 
                 if exts and os.path.splitext(name)[1].lower() not in exts:
                     continue
                 if name_matches(name, query):
-                    hits.append(Path(dirpath) / name)
-                    if len(hits) >= limit:
-                        return hits, True
+                    exact.append(Path(dirpath) / name)
+                    if len(exact) >= limit:
+                        return result(), True
+                elif len(words) == 1 or any(w in _norm(name).split() for w in words):  # cheap pre-check
+                    score = match_score(name, query)
+                    if score:
+                        close.append((Path(dirpath) / name, score))
             if time.monotonic() > deadline:
-                return hits, False
-    return hits, True
+                finished = False
+                break
+        if not finished:
+            break
+    return result(), finished
 
 
 def say_seconds(total: int) -> str:
@@ -479,7 +789,12 @@ def build_tools(
     notify: Notify,
     jobs: JobManager,
     extra: list[Callable] | None = None,
+    choose: Choose | None = None,
 ) -> list[Callable]:
+    if choose is None:  # no multi-answer questions available: fall back to yes/no
+        def choose(question: str, options: dict[str, list[str]]) -> str | None:
+            return "save" if confirm(question.split(" Say ")[0] + " Save them first?") else None
+
     screenshots = paths.PROJECT_DIR / "screenshots"
     anywhere = "*" in cfg.writable_folders
     writable = [paths.expand(p).resolve() for p in cfg.writable_folders if p != "*"]
@@ -527,9 +842,17 @@ def build_tools(
             name: The application's name as the user said it.
         """
         key = name.lower().strip()
-        target = cfg.apps.get(key) or next((v for k, v in cfg.apps.items() if k in key or key in k), None)
+        squashed = key.replace(" ", "")
+        target = cfg.apps.get(key) or next(
+            (v for k, v in cfg.apps.items() if k in key or key in k or k.replace(" ", "") == squashed), None)
+        if not target:  # a built-in Windows app: Task Manager, Calculator, Paint, Settings...
+            target = WINDOWS_APP_COMMANDS.get(WINDOWS_APPS.get(squashed.replace(" ", ""), ""))
         if not target:
-            return f"'{name}' is not in my app list. Known apps: {', '.join(cfg.apps) or 'none'}."
+            guess = closest_name(name, list(cfg.apps))
+            if guess and confirm(f"I don't have {name}. Did you mean {guess}?"):
+                name, target = guess, cfg.apps[guess]
+            else:
+                return f"'{name}' is not in my app list. Known apps: {', '.join(cfg.apps) or 'none'}."
         expanded = os.path.expandvars(target)
         try:
             if Path(expanded).exists():
@@ -562,26 +885,77 @@ def build_tools(
         subprocess.Popen([chrome, f"--profile-directory={folder}"], close_fds=True)
         return f"Opened Chrome as {label.split(' (')[0]}."
 
-    def close_app(process_name: str) -> str:
-        """Close a running application by its process name, for example "chrome" or "notepad". Asks to confirm first.
+    def close_app(name: str, force: bool = False) -> str:
+        """Close an app the polite way, like clicking its X. If it asks to save changes, this asks the
+        user (save, don't save or cancel) and presses the answer, so call it only once per request.
 
         Args:
-            process_name: Executable name with or without ".exe".
+            name: The app as the user said it, e.g. "KMPlayer", "Notepad", "Chrome".
+            force: True only if it's frozen or ignored a normal close; the user is asked first,
+                because unsaved work is lost.
         """
         import psutil
 
-        target = process_name.lower().removesuffix(".exe") + ".exe"
-        procs = [p for p in psutil.process_iter(["name"]) if (p.info["name"] or "").lower() == target]
-        if not procs:
-            return f"{process_name} isn't running."
-        if not confirm(f"Close {process_name}? Unsaved work in it may be lost."):
-            return "Cancelled."
-        for p in procs:
-            try:
-                p.terminate()
-            except psutil.Error:
-                pass
-        return f"Closed {process_name}."
+        windows = [(h, pid) for h, pid in find_windows_by_name(name) if _process_matches(pid, name)]
+        pids = {pid for _, pid in windows} | {
+            p.pid for p in psutil.process_iter(["name"])
+            if app_matches(name, p.info["name"] or "") and (p.info["name"] or "").lower() != "explorer.exe"
+        }
+        pids.discard(os.getpid())  # never close Amolex itself
+        if not pids:
+            guess = closest_name(name, running_app_names())
+            if guess and confirm(f"{name} isn't open. Did you mean {guess}?"):
+                return close_app(guess, force)
+            return f"{name} isn't running."
+        if force:
+            if not confirm(f"Force {name} to close? Anything unsaved in it is lost."):
+                return "Cancelled."
+            for pid in pids:
+                try:
+                    psutil.Process(pid).kill()
+                except psutil.Error:
+                    pass
+            return f"Force-closed {name}."
+        if not windows:
+            return f"{name} is running in the background with no window. Say force close {name} to end it."
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        posted = [user32.PostMessageW(hwnd, 0x0010, 0, 0) for hwnd, _ in windows]  # WM_CLOSE: like clicking X
+        if not any(posted):  # Windows refuses messages to apps running as administrator (Task Manager)
+            return (f"Windows won't let me close {name} because it runs as administrator. "
+                    "Run Amolex as administrator to control it.")
+
+        def open_windows() -> list[int]:
+            if not any(psutil.pid_exists(pid) for pid in pids):
+                return []
+            return [h for h, pid in find_windows_by_name(name) if _process_matches(pid, name)]
+
+        def wait_closed(seconds: float) -> list[int]:
+            remaining = open_windows()
+            for _ in range(int(seconds / 0.25)):
+                if not remaining:
+                    break
+                time.sleep(0.25)
+                remaining = open_windows()
+            return remaining
+
+        question = f"{name} wants to know whether to save your changes. Say save, don't save, or cancel."
+        remaining = wait_closed(2)
+        last = None
+        for _ in range(6):  # one prompt per unsaved document (Notepad asks for each tab)
+            if not remaining:
+                return f"Closed {name}" + (" without saving." if last == "dont_save" else ".")
+            choice = answer_save_prompt(remaining, lambda: choose(question, SAVE_CHOICES))
+            if choice is None:
+                break
+            if choice == "unanswered":
+                return f"I didn't catch an answer, so I left {name} open with its save question."
+            if choice == "cancel":
+                return f"Okay, I left {name} open."
+            last = choice
+            remaining = wait_closed(2)
+        if last == "save":  # a new, never-saved document opens a Save As window
+            return f"{name} is asking where to save it. Pick a name and folder on screen, and it will close."
+        return f"{name} is still open; it may be asking you something I can't read."
 
     def open_folder(path: str) -> str:
         """Open a folder in File Explorer, for example "Downloads" or "E:\\Movie".
@@ -730,6 +1104,41 @@ def build_tools(
             app: The app's name.
         """
         return _focus(app) or f"Switched to {app}."
+
+    # ------------------------------------------------------------------ seeing the screen
+    def list_open_windows() -> str:
+        """List every open window (title and app), front-most first. Use it to work out which app or
+        document the user means, e.g. "close that", "the video", "the other one"."""
+        windows = list_windows()
+        if not windows:
+            return "No app windows are open."
+        return "Open windows, front first: " + "; ".join(
+            f"{title} ({program})" if program else title for _, title, program in windows[:20])
+
+    def read_screen(app: str = "") -> str:
+        """Read the text on screen in the window in front (or a named app's window): its title, buttons,
+        menus, labels and the text in documents, pages and boxes, like a screen reader. Call this first
+        when the user says "this", "that", "it", "what's on my screen" or refers to something they see.
+        Pictures, video and games have no readable text.
+
+        Args:
+            app: Optional app to read instead of the one in front, e.g. "chrome" or "notepad".
+        """
+        if app.strip():
+            hwnd = find_window_by_name(app)
+            if not hwnd:
+                return f"I can't find an open {app} window."
+            match = next(((h, t, p) for h, t, p in list_windows() if h == hwnd), (hwnd, app, app))
+        else:
+            windows = list_windows()
+            if not windows:
+                return "No app windows are open."
+            match = windows[0]
+        hwnd, title, program = match
+        text = read_window_text(hwnd)
+        others = [t for h, t, _ in list_windows()[:6] if h != hwnd]
+        return (f"In front: {title} ({program}).\n" + (text or "It has no readable text (a picture, video or game?).")
+                + ("\nOther open windows: " + "; ".join(others) if others else ""))
 
     # ------------------------------------------------------------------ files and folders
     def write_file(path: str, content: str, append: bool = False) -> str:
@@ -935,23 +1344,48 @@ def build_tools(
         return dt.datetime.now().strftime("%A %d %B %Y, %I:%M %p")
 
     # ------------------------------------------------------------------ files
-    def find_files(name: str, kind: str = "", folder: str = "") -> str:
+    def find_files(name: str, kind: str = "", folder: str = "", pick_one: bool = False) -> str:
         """Search the PC for files or folders by name, e.g. a video, song, photo or document.
-        Words can be in any order and spelling of dots or dashes doesn't matter: "black clover"
-        finds "Black.Clover.S01E05.mkv". Use this before open_file when you don't know the path.
+        Names don't have to be exact: word order, dots and dashes don't matter, and close spellings
+        are found too ("black cover" finds "Black.Clover.S01E05.mkv"). Use this before open_file,
+        move_item etc. when you don't know the path.
 
         Args:
-            name: Words from the name, e.g. "black clover" or "invoice march".
+            name: Words from the name as the user said them, e.g. "black clover" or "invoice march".
             kind: Optional: video, audio, image or document, to find only that type.
             folder: Optional folder to search in, e.g. "E:\\Anime" or "Downloads". Empty searches everywhere.
+            pick_one: True when the user wants ONE file to act on (play, open, move...). If the match
+                isn't exact, or there are several, the user is asked to confirm, and the one path to
+                use is returned.
         """
         roots = [resolve_user_path(folder)] if folder.strip() else _search_roots()
         hits, finished = search_files(name, roots, cfg.search_seconds, kind)
+        what = f"{kind} files" if kind else "files"
         if not hits:
-            return f"I found no {kind + ' ' if kind else ''}files named like '{name}'" + (
-                "." if finished else f" in {cfg.search_seconds:.0f} seconds of searching; tell me which folder it's in.")
-        listed = "; ".join(str(h) for h in hits)
-        return f"Found {len(hits)}{'+' if len(hits) >= 10 else ''}: {listed}"
+            return f"I found no {what} named like '{name}'" + (
+                "." if finished else f" in {cfg.search_seconds:.0f} seconds of searching; ask which folder it's in.")
+        exact = [p for p, s in hits if s >= 1.0]
+        close = [p for p, s in hits if s < 1.0]
+        if not pick_one:
+            parts = [f"Found {len(exact)}: " + "; ".join(map(str, exact))] if exact else []
+            if close:
+                parts.append("Close but not exact (check with the user before using): " + "; ".join(map(str, close)))
+            return " ".join(parts)
+
+        # one file to act on: verify anything that isn't a single clear match (RK's rule)
+        if len(exact) == 1:
+            return f"Use this file: {exact[0]}"
+        if exact:
+            question = f"I found {len(exact)} matches. Do you mean {pretty_name(exact[0])}?"
+            candidates = exact
+        else:
+            question = f"I couldn't find {name} exactly. The closest is {pretty_name(close[0])}. Is that it?"
+            candidates = close
+        if confirm(question):
+            return f"The user confirmed. Use this file: {candidates[0]}"
+        options = "; ".join(pretty_name(p) for p in candidates[1:6])
+        return ("The user said that's not the one. " + (f"Tell them the other matches and ask which: {options}."
+                if options else "There are no other matches; ask them for the exact name or folder."))
 
     def open_file(path: str, app: str = "") -> str:
         """Open a file or folder, in its usual app or a named one, e.g. a video in KMPlayer.
@@ -1031,7 +1465,7 @@ def build_tools(
 
     tools: list[Callable] = [
         open_app, open_chrome_profile, close_app, open_folder, open_website, search_youtube, open_settings,
-        media_control, player_control, type_text, press_keys, switch_to_app,
+        media_control, player_control, list_open_windows, read_screen, type_text, press_keys, switch_to_app,
         write_file, create_folder, list_folder, move_item, recycle_item,
         take_screenshot, system_status, lock_pc, power, cancel_shutdown,
         set_timer, get_current_time, find_files, open_file, read_text_file, undo_last_git_commit,

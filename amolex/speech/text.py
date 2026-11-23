@@ -16,6 +16,30 @@ def normalise(text: str) -> str:
     return " ".join(words(text))
 
 
+def pick_option(reply: str, options: dict[str, list[str]]) -> str | None:
+    """Which option a spoken answer chose. Options are checked in order, so put the longer phrase
+    first: "don't save" must win over "save"."""
+    said = " " + " ".join(words(reply.replace("’", "'"))) + " "
+    for key, phrases in options.items():
+        if any(f" {p} " in said for p in phrases):
+            return key
+    return None
+
+
+_NOT_DONE = re.compile(
+    r"^(sorry|i can't|i cannot|i couldn't|i didn't|i don't|i won't|i'm not sure|cancelled|there's nothing|"
+    r"there are no|no \w+ (is|are) running|the user said|windows couldn't|it failed|i found no|okay, i left|"
+    r"i didn't catch)"
+    r"|isn't running|is still open|is asking|\?$",
+    re.IGNORECASE,
+)
+
+
+def task_succeeded(reply: str) -> bool:
+    """False for failures, refusals, cancellations and questions: those don't get "The task is done."."""
+    return bool(reply.strip()) and not _NOT_DONE.search(reply.strip().replace("’", "'"))
+
+
 _FRAGMENTS = {"open", "launch", "start", "close", "write", "type", "search", "play", "go", "hey", "ok", "okay", "um", "uh"}
 
 

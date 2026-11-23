@@ -43,11 +43,14 @@ class SpeechCfg(BaseModel):
     whisper_model: str = "base"
     # Spellings Whisper should expect ("Plot Desktop" for Claude). Only names, no commands: with
     # "Open Claude. Open KMPlayer..." here, Whisper wrote "Open." for silence again and again.
-    whisper_prompt: str = "Amolex, KMPlayer, Claude, Gemini, Chrome, Notepad, VS Code, YouTube."
+    whisper_prompt: str = "Amolex, KMPlayer, Claude, Gemini, Chrome, Notepad, VS Code, YouTube, Task Manager."
     language: str = "en"
     attentive_timeout_seconds: float = 6
     end_of_speech_ms: int = 700
     max_utterance_seconds: float = 12
+    # A task still running after this long gets "This will take a moment...", and "The task is done."
+    # at the end. Time spent waiting for your yes/no doesn't count. 0 turns it off.
+    slow_notice_seconds: float = 3
 
 
 Tier = Literal["light", "normal", "heavy"]

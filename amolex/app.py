@@ -27,7 +27,10 @@ from .config import CommandSet, Config
 from .fast import actions
 from .fast.rules import new_commands
 from .log import timed
-from .speech.text import contains_phrase, is_fragment, normalise, parse_gaming, parse_switch, speakable, strip_wake, yes_no
+from .speech.text import (
+    contains_phrase, is_fragment, normalise, parse_gaming, parse_switch, pick_option, speakable, strip_wake,
+    task_succeeded, yes_no,
+)
 from .speech.transcribe import Transcriber
 from .speech.vosk_engine import GrammarRecognizer, Hit
 from .speech.wake import WakeTracker
@@ -60,7 +63,8 @@ class App:
         self.speaker = Speaker(cfg.voice)
         self.ai = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ai")
         self.jobs = JobManager(cfg.delegates, cfg.jobs, notify=self.notify)
-        tools = build_tools(cfg.tools, self.confirm, self.notify, self.jobs, extra=[self._switch_tool()])
+        tools = build_tools(cfg.tools, self.confirm, self.notify, self.jobs, extra=[self._switch_tool()],
+                            choose=self.choose)
         self.tools = {t.__name__: t for t in tools}  # also used by instant commands
         self.brain = Brain(cfg, tools, has_delegates=bool(self.jobs.available()))
 
@@ -74,6 +78,7 @@ class App:
         self._reset_endpointer = threading.Event()
         self._transcribing = threading.Event()
         self._asking = threading.Event()  # an AI answer is in progress: don't unload the model under it
+        self._voice = threading.Lock()  # the slow-task notice and yes/no questions never talk over each other
         self._attentive_since = 0.0
         self._attentive_limit = cfg.speech.attentive_timeout_seconds  # longer during a follow-up window
         self._fallback_announced = False
@@ -302,22 +307,61 @@ class App:
         one_model = self.brain.router.model_for("heavy") == self.brain.router.model_for("normal")
         if route and route.tier == "heavy" and not one_model:  # nothing to ask when there's only one model
             route = self._approve_heavy(route)
-        elif route and not self.brain.local.is_loaded(route.model):
+        loading = bool(route and not self.brain.local.is_loaded(route.model))
+        if loading and not (route.tier == "heavy" and not one_model):
             self.say("One moment, loading the model.", State.THINKING)
         if self.tray and route:
             self.tray.update(State.THINKING, f"{route.model}, {route.tier}")
         self._asking.set()
         try:
-            answer = self.brain.ask(text, route)
+            answer, announced = self._with_slow_notice(lambda: self.brain.ask(text, route), already=loading)
         finally:
             self._asking.clear()
         reply = answer.text
+        if announced and task_succeeded(reply):
+            reply = reply.rstrip() + " The task is done."
         if answer.fell_back and not self._fallback_announced:
             reply = "Gemini isn't available, so I'm using the local model. " + reply
             self._fallback_announced = True
         elif answer.provider == "gemini":
             self._fallback_announced = False
         self.say(reply, self._after_answer())
+
+    def _with_slow_notice(self, work, already: bool = False):
+        """Run work(); if it's still busy after `slow_notice_seconds` (not counting time spent asking
+        you yes/no or talking), say it will take a moment. Returns (result, whether you were told)."""
+        limit = self.cfg.speech.slow_notice_seconds
+        if limit <= 0:
+            return work(), already
+        done = threading.Event()
+        told = threading.Event()
+        if already:
+            told.set()
+
+        def watch() -> None:
+            busy, last = 0.0, time.monotonic()
+            while not done.wait(0.2):
+                now = time.monotonic()
+                if not self._awaiting_confirm.is_set() and not self.speaker.speaking:
+                    busy += now - last
+                last = now
+                if busy >= limit and not told.is_set():
+                    with self._voice:
+                        if done.is_set() or self._awaiting_confirm.is_set():
+                            continue
+                        told.set()
+                        log.info("slow task: telling the user it will take a moment")
+                        self.speaker.say("This will take a moment. I'll tell you when it's done.")
+                        self._reset_endpointer.set()
+
+        watcher = threading.Thread(target=watch, name="slow-notice", daemon=True)
+        watcher.start()
+        try:
+            result = work()
+        finally:
+            done.set()
+            watcher.join(timeout=15)  # let the notice finish before the answer is spoken
+        return result, told.is_set()
 
     def _after_answer(self) -> State:
         """Open a follow-up window (no wake word needed) unless it's off or a game is running,
@@ -377,24 +421,46 @@ class App:
         before = self.sm.state
         self.say(text, before if before in (State.STANDBY, State.ACTIVE) else State.ACTIVE)
 
-    def confirm(self, question: str) -> bool:
-        """Ask a yes/no question out loud and wait for the answer (called from tools)."""
+    def _ask_aloud(self, prompt: str, wait_seconds: float = 8) -> str:
+        """Speak a question and return what you answered ('' if nothing). Called from tools."""
         while not self.confirm_replies.empty():
             self.confirm_replies.get_nowait()
-        self.speaker.say(f"{question} Yes or no?", on_start=lambda: self.sm.set(State.SPEAKING))
+        with self._voice:
+            self._awaiting_confirm.set()  # the slow-task timer pauses while you're being asked
+            self.speaker.say(prompt, on_start=lambda: self.sm.set(State.SPEAKING))
         self._reset_endpointer.set()
-        self._awaiting_confirm.set()
+        while not self.confirm_replies.empty():  # anything heard while it was asking is its own voice
+            self.confirm_replies.get_nowait()
         self.sm.set(State.CONFIRM)
+        deadline = time.monotonic() + wait_seconds
         try:
-            reply = self.confirm_replies.get(timeout=8)
-        except queue.Empty:
-            reply = ""
+            # Empty transcripts are the tail of its own voice or noise, not your answer: keep waiting.
+            # (On RK's PC every "Did you mean Taskmgr?" got '' instantly and was taken as "no".)
+            while (left := deadline - time.monotonic()) > 0:
+                try:
+                    reply = self.confirm_replies.get(timeout=left)
+                except queue.Empty:
+                    break
+                if reply.strip():
+                    return reply
+            return ""
         finally:
             self._awaiting_confirm.clear()
             self.sm.set(State.THINKING)
+
+    def confirm(self, question: str) -> bool:
+        """Ask a yes/no question out loud and wait for the answer (called from tools)."""
+        reply = self._ask_aloud(f"{question} Yes or no?")
         decision = yes_no(reply)
         log.info("confirm %r -> %r -> %s", question, reply, decision)
         return decision is True
+
+    def choose(self, question: str, options: dict[str, list[str]]) -> str | None:
+        """Ask a question with several answers ("save, don't save, or cancel?"); None if unclear."""
+        reply = self._ask_aloud(question, wait_seconds=10)
+        choice = pick_option(reply, options)
+        log.info("choose %r -> %r -> %s", question, reply, choice)
+        return choice
 
     # ---------------------------------------------------------------- controls
     def toggle(self) -> None:

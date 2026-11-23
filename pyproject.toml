@@ -29,6 +29,8 @@ dependencies = [
     "pystray>=0.19.5",
     "pillow>=10.3",
     "psutil>=5.9",
+    # reading and pressing buttons in other apps' windows (Notepad's "Save / Don't save" prompt)
+    "uiautomation>=2.0.18; sys_platform == 'win32'",
 ]
 
 [dependency-groups]
