@@ -116,6 +116,7 @@ class BrainCfg(BaseModel):
     keep_alive: str = "24h"
     heavy_keep_alive: str = "5m"
     load_timeout_seconds: float = 240  # the 20B (~13 GB) can take 1.5-2 min to load from a hard drive
+    expected_load_seconds: float = 100  # used for "still loading, about N seconds"; updated after each load
     # A 20B model fills ~14 GB of the 16 GB GPU, which games need: release it while a game runs,
     # load it again when the game closes
     free_gpu_while_gaming: bool = True

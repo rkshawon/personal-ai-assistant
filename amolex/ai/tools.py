@@ -221,12 +221,89 @@ WINDOWS_APPS = {
     "word": "winword", "excel": "excel", "powerpoint": "powerpnt", "visualstudiocode": "code", "vscode": "code",
     "fileexplorer": "explorer", "photos": "photos", "snippingtool": "snippingtool", "spotify": "spotify",
 }
-# How to open them when they aren't in config.json's app list
+# How to open them directly (Settings, for one, isn't an .exe in the Start menu)
 WINDOWS_APP_COMMANDS = {
     "taskmgr": "taskmgr.exe", "calculatorapp": "calc.exe", "mspaint": "mspaint.exe", "cmd": "cmd.exe",
     "powershell": "powershell.exe", "windowsterminal": "wt.exe", "control": "control.exe",
     "systemsettings": "ms-settings:", "msedge": "msedge.exe", "snippingtool": "snippingtool.exe",
 }
+
+
+_start_apps: list[tuple[str, str]] = []  # (name, AppID) from the Start menu
+_start_apps_at = 0.0
+_start_apps_lock = threading.Lock()
+
+
+def start_menu_apps(max_age: float = 600) -> list[tuple[str, str]]:
+    """Every app in the Start menu, desktop programs and Store apps alike, as (name, AppID).
+
+    Windows' own list (Get-StartApps), so anything you can find in Start search can be opened.
+    Cached for 10 minutes; newly installed apps show up after that.
+    """
+    global _start_apps, _start_apps_at
+    if os.name != "nt":
+        return _start_apps
+    with _start_apps_lock:
+        if _start_apps and time.monotonic() - _start_apps_at < max_age:
+            return _start_apps
+        import json
+
+        try:
+            res = _run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                        "Get-StartApps | Select-Object Name, AppID | ConvertTo-Json -Compress"])
+            data = json.loads(res.stdout or "[]")
+            data = [data] if isinstance(data, dict) else data
+            _start_apps = [(d["Name"], d["AppID"]) for d in data if d.get("Name") and d.get("AppID")]
+            _start_apps_at = time.monotonic()
+            log.info("found %d apps in the Start menu", len(_start_apps))
+        except (OSError, ValueError, KeyError) as e:
+            log.warning("couldn't read the Start menu apps: %s", e)
+        return _start_apps
+
+
+_KNOWN_FOLDER_IDS = {  # how Start menu AppIDs write common folders
+    "{6D809377-6AF0-444B-8957-A3773F02200E}": "%ProgramW6432%",
+    "{7C5A40EF-A0FB-4BFC-874A-C0F2E0B9FA8E}": "%ProgramFiles(x86)%",
+    "{F38BF404-1D43-42F2-9305-67DE0B28FC23}": "%SystemRoot%",
+    "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}": "%SystemRoot%\\System32",
+}
+
+
+def app_exe_from_id(app_id: str) -> str | None:
+    """The .exe behind a Start menu AppID, when it is one ('{6D80...}\\KMPlayer 64X\\KMPlayer64.exe'),
+    so a file can be opened with it. Store apps have no .exe path: None."""
+    if not app_id.lower().endswith(".exe"):
+        return None
+    for guid, folder in _KNOWN_FOLDER_IDS.items():
+        if app_id.upper().startswith(guid):
+            app_id = os.path.expandvars(folder) + app_id[len(guid):]
+            break
+    return app_id if Path(app_id).exists() else None
+
+
+def _squash(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def match_start_app(spoken: str, apps: list[tuple[str, str]]) -> tuple[list[tuple[str, str]], bool]:
+    """Apps whose name fits what was said. Returns (matches, sure): sure means one clear match
+    ('antigravity' -> Antigravity); otherwise the caller asks "Did you mean ...?"."""
+    wanted = _squash(spoken.removesuffix(" app").removesuffix(" application"))
+    if not wanted:
+        return [], False
+    exact = [a for a in apps if _squash(a[0]) == wanted]
+    if exact:
+        return exact[:1], True
+    starts = sorted((a for a in apps if _squash(a[0]).startswith(wanted)), key=lambda a: len(a[0]))
+    if len(starts) == 1:
+        return starts, True
+    if starts:
+        return starts, False  # "word" -> Word, WordPad...: ask about the shortest
+    inside = sorted((a for a in apps if wanted in _squash(a[0]) and len(wanted) >= 4), key=lambda a: len(a[0]))
+    if inside:
+        return inside, len(inside) == 1
+    guess = closest_name(spoken, [a[0] for a in apps])
+    return ([a for a in apps if a[0] == guess][:1], False) if guess else ([], False)
 
 
 def app_matches(spoken: str, exe_name: str) -> bool:
@@ -836,23 +913,34 @@ def build_tools(
 
     # ------------------------------------------------------------------ apps and places
     def open_app(name: str) -> str:
-        """Open a desktop application by its friendly name, for example "VS Code", "Chrome" or "Claude".
+        """Open ANY installed app by name, e.g. "VS Code", "Antigravity", "Steam", "Spotify", "Calculator".
+        Works for every app in the Windows Start menu, so don't search for it as a file.
 
         Args:
             name: The application's name as the user said it.
         """
         key = name.lower().strip()
         squashed = key.replace(" ", "")
+        # 1. nicknames from config.json, 2. built-in Windows tools, 3. everything in the Start menu
         target = cfg.apps.get(key) or next(
             (v for k, v in cfg.apps.items() if k in key or key in k or k.replace(" ", "") == squashed), None)
         if not target:  # a built-in Windows app: Task Manager, Calculator, Paint, Settings...
             target = WINDOWS_APP_COMMANDS.get(WINDOWS_APPS.get(squashed.replace(" ", ""), ""))
         if not target:
+            matches, sure = match_start_app(name, start_menu_apps())
+            if matches:
+                app_name, app_id = matches[0]
+                if not sure and not confirm(f"Did you mean {app_name}?"):
+                    others = ", ".join(a[0] for a in matches[1:5])
+                    return "Okay, I didn't open anything." + (f" Close matches: {others}." if others else "")
+                subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{app_id}"], close_fds=True)
+                return f"Opened {app_name}."
+        if not target:
             guess = closest_name(name, list(cfg.apps))
             if guess and confirm(f"I don't have {name}. Did you mean {guess}?"):
                 name, target = guess, cfg.apps[guess]
             else:
-                return f"'{name}' is not in my app list. Known apps: {', '.join(cfg.apps) or 'none'}."
+                return f"I couldn't find an app called {name} on this PC."
         expanded = os.path.expandvars(target)
         try:
             if Path(expanded).exists():
@@ -1405,8 +1493,12 @@ def build_tools(
         exe = os.path.expandvars(target) if target else None
         if exe and not Path(exe).exists():
             exe = shutil.which(exe)
+        if not exe:  # any installed app whose Start menu entry points at its .exe (VLC, Photoshop...)
+            matches, sure = match_start_app(app, start_menu_apps())
+            if matches and (sure or confirm(f"Open it with {matches[0][0]}?")):
+                exe = app_exe_from_id(matches[0][1])
         if not exe:
-            return f"I don't know where {app} is installed. Known apps: {', '.join(cfg.apps) or 'none'}."
+            return f"I can't open files with {app} directly. I can open the file in its usual app instead."
         subprocess.Popen([exe, str(p)], close_fds=True)
         return f"Opened {p.name} in {app}."
 

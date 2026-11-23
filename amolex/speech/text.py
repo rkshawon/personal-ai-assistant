@@ -16,6 +16,17 @@ def normalise(text: str) -> str:
     return " ".join(words(text))
 
 
+def say_duration(seconds: float) -> str:
+    """100 -> 'about a minute and a half', 45 -> 'about 45 seconds', 200 -> 'about 3 minutes'."""
+    if seconds < 60:
+        return f"about {max(5, int(round(seconds / 5) * 5))} seconds"
+    if seconds < 75:
+        return "about a minute"
+    if seconds < 110:
+        return "about a minute and a half"
+    return f"about {round(seconds / 60)} minutes"
+
+
 def pick_option(reply: str, options: dict[str, list[str]]) -> str | None:
     """Which option a spoken answer chose. Options are checked in order, so put the longer phrase
     first: "don't save" must win over "save"."""

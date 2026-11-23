@@ -317,7 +317,7 @@ def test_unsure_matches_are_confirmed(tmp_path):
     assert "not the one" in out and "Black Clover S2 176" in out
     # apps: a misheard name is checked, not refused or guessed
     answers.append(False)
-    assert "not in my app list" in t["open_app"]("note bad")
+    assert "couldn't find an app called note bad" in t["open_app"]("note bad")
     assert asked[-1] == "I don't have note bad. Did you mean notepad?"
     assert tools_mod.closest_name("game player", ["KMPlayer64", "chrome", "Code"]) == "KMPlayer64"
     assert tools_mod.closest_name("spotify", ["KMPlayer64", "chrome"]) is None
@@ -420,6 +420,30 @@ def test_answers_ignore_its_own_echo(monkeypatch):
     assert app.confirm("Did you mean Taskmgr?") is True
 
 
+def test_loading_messages(monkeypatch):
+    import sys
+    import time
+    import types
+
+    for m in ("sounddevice", "numpy", "pyautogui", "pydirectinput", "psutil", "vosk", "webrtcvad"):
+        monkeypatch.setitem(sys.modules, m, sys.modules.get(m) or types.ModuleType(m))
+    v = sys.modules["vosk"]
+    if not hasattr(v, "Model"):
+        v.KaldiRecognizer = v.Model = object
+        v.SetLogLevel = lambda *a: None
+    from amolex.app import App
+
+    app = App.__new__(App)
+    app.cfg = Config()
+    app._loading_since = None
+    assert app._loading_notice() == "One moment, loading the model."
+    # from RK's log: he spoke 9 s after "Online" while the 20B was still loading from the hard drive
+    app._loading_since = time.monotonic() - 9
+    assert app._loading_notice() == "The AI is still loading, about 90 more seconds. I'll answer as soon as it's ready."
+    app._loading_since = time.monotonic() - 95
+    assert app._loading_notice() == "The AI is almost loaded. I'll answer in a moment."
+
+
 def test_read_screen(monkeypatch):
     from amolex.ai import tools as tools_mod
     from amolex.ai.jobs import JobManager
@@ -439,6 +463,42 @@ def test_read_screen(monkeypatch):
     assert "no readable text" in t["read_screen"]("kmplayer")  # video: nothing to read, and it says so
     assert "can't find an open zoom window" in t["read_screen"]("zoom")
     assert t["list_open_windows"]().startswith("Open windows, front first: Untitled - Notepad (Notepad);")
+
+
+def test_any_installed_app_opens(monkeypatch):
+    import subprocess
+
+    from amolex.ai import tools as tools_mod
+    from amolex.ai.jobs import JobManager
+    from amolex.config import JobsCfg, ToolsCfg
+    from amolex.ai.tools import app_exe_from_id, match_start_app
+
+    start = [("Antigravity", "Google.Antigravity"), ("Steam", "Valve.Steam"), ("Word", "Microsoft.Office.WINWORD.EXE"),
+             ("WordPad", "Microsoft.Windows.WordPad"), ("Visual Studio Code", "Microsoft.VisualStudioCode"),
+             ("Spotify", "SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify")]
+    # from RK's log: "Antigravity" isn't in config.json, but it's installed: open it
+    assert match_start_app("antigravity", start) == ([("Antigravity", "Google.Antigravity")], True)
+    assert match_start_app("Antigravity app", start)[1] is True
+    assert match_start_app("spotify", start)[0][0][0] == "Spotify"
+    matches, sure = match_start_app("word", start)  # Word and WordPad: exact name wins
+    assert matches[0][0] == "Word" and sure
+    matches, sure = match_start_app("visual studio", start)
+    assert matches[0][0] == "Visual Studio Code" and sure
+    matches, sure = match_start_app("anti gravy tea", start)  # misheard: offered, not opened blindly
+    assert matches[0][0] == "Antigravity" and not sure
+    assert match_start_app("photoshop", start) == ([], False)
+    assert app_exe_from_id("Google.Antigravity") is None  # Store-style IDs have no .exe
+
+    launched, asked = [], []
+    monkeypatch.setattr(tools_mod, "start_menu_apps", lambda max_age=600: start)
+    monkeypatch.setattr(subprocess, "Popen", lambda args, **k: launched.append(args))
+    t = {f.__name__: f for f in tools_mod.build_tools(
+        ToolsCfg(), confirm=lambda q: (asked.append(q), True)[1], notify=lambda m: None,
+        jobs=JobManager({}, JobsCfg(), lambda m: None))}
+    assert t["open_app"]("Antigravity") == "Opened Antigravity." and not asked
+    assert launched[-1] == ["explorer.exe", "shell:AppsFolder\\Google.Antigravity"]
+    assert t["open_app"]("anti gravy tea") == "Opened Antigravity." and asked == ["Did you mean Antigravity?"]
+    assert "couldn't find an app called Photoshop" in t["open_app"]("Photoshop")
 
 
 def test_app_name_matching():

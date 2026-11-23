@@ -2,7 +2,7 @@
   "assistant_name": "Amolex-9026",
   "user_name": "RK",
   "audio": {
-    "input_device": "AB13X",
+    "input_device": "Virtual Mic",
     "sample_rate": 16000,
     "block_ms": 30,
     "gain": 1.0

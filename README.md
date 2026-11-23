@@ -56,6 +56,10 @@ No Gemini key is needed: the brain is local. (Gemini via API key is still option
   in any app, open and switch apps, type into them ("open Notepad and write Hello World"), press
   shortcuts ("press ctrl+s in Notepad"), create and edit text files, make and list folders, move or
   rename files, send files to the Recycle Bin, and run PowerShell for anything else.
+- **Any installed app opens by name:** "open Antigravity", "open Steam", "open Calculator". It uses the
+  Windows Start menu's own app list (refreshed every 10 minutes), so anything you can find in Start
+  search works. A close-but-unsure name is checked first ("Did you mean Antigravity?").
+  `tools.apps` in `config.json` is now only for nicknames or exact paths.
 - **Reading the screen:** "what's on my screen?", "close that", "read this to me". It reads the window
   in front as text, like Windows' Narrator does (title, buttons, menus, labels, text in documents and
   web pages), and lists open windows, so "this" and "that" make sense to it. It can't see pictures,

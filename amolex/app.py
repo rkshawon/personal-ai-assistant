@@ -20,7 +20,7 @@ from .ai import intents
 from .ai.brain import Brain
 from .ai.jobs import JobManager
 from .ai.providers import unload, warm_up
-from .ai.tools import build_tools
+from .ai.tools import build_tools, start_menu_apps
 from .audio.capture import MicStream
 from .audio.vad import Endpointer
 from .config import CommandSet, Config
@@ -28,7 +28,7 @@ from .fast import actions
 from .fast.rules import new_commands
 from .log import timed
 from .speech.text import (
-    contains_phrase, is_fragment, normalise, parse_gaming, parse_switch, pick_option, speakable, strip_wake,
+    contains_phrase, is_fragment, normalise, parse_gaming, parse_switch, pick_option, say_duration, speakable, strip_wake,
     task_succeeded, yes_no,
 )
 from .speech.transcribe import Transcriber
@@ -79,6 +79,7 @@ class App:
         self._transcribing = threading.Event()
         self._asking = threading.Event()  # an AI answer is in progress: don't unload the model under it
         self._voice = threading.Lock()  # the slow-task notice and yes/no questions never talk over each other
+        self._loading_since: float | None = None  # when the main model started loading, while it loads
         self._attentive_since = 0.0
         self._attentive_limit = cfg.speech.attentive_timeout_seconds  # longer during a follow-up window
         self._fallback_announced = False
@@ -90,12 +91,18 @@ class App:
         self.running.set()
         threading.Thread(target=self._load_whisper, name="whisper-load", daemon=True).start()
         threading.Thread(target=self._stt_loop, name="stt", daemon=True).start()
+        threading.Thread(target=start_menu_apps, name="app-list", daemon=True).start()  # read installed apps now
         if self.cfg.brain.provider == "local":  # load models now, not in the middle of a question
             threading.Thread(target=self._warm_models, name="warm-up", daemon=True).start()
         self._start_hotkey()
         self._start_tray()
         self.mic.start()
-        self.ai.submit(self.say, f"Online, {self.cfg.user_name}. Press {self.cfg.wake.hotkey.upper()} or say the wake word.", State.STANDBY)
+        greeting = f"Online, {self.cfg.user_name}. Press {self.cfg.wake.hotkey.upper()} or say the wake word."
+        if self.cfg.brain.provider == "local" and self._model_cold():
+            how_long = say_duration(self.cfg.brain.expected_load_seconds)
+            greeting = (f"Online, {self.cfg.user_name}. The AI is still loading, {how_long}. Simple commands like "
+                        "time, volume and opening apps work now. I'll tell you when it's ready.")
+        self.ai.submit(self.say, greeting, State.STANDBY)
         log.info("%s running. Wake phrases: %s", self.cfg.assistant_name, sorted(self.wake_phrases) or "none")
         try:
             self._audio_loop()
@@ -136,10 +143,38 @@ class App:
                         unload(self.cfg.brain, model)
                 warmed = False
             elif not warmed:
+                cold = not all(self.brain.local.is_loaded(m) for m in models)
+                if cold:
+                    self._loading_since = time.monotonic()
                 for model in models:
                     warm_up(self.cfg.brain, model)
+                if cold and self._loading_since is not None:
+                    took = time.monotonic() - self._loading_since
+                    self.cfg.brain.expected_load_seconds = took  # better guess next time
+                    if took > 5:
+                        self.notify(f"The AI is ready, {self.cfg.user_name}.")
+                self._loading_since = None
                 warmed = True
             time.sleep(10)
+
+    def _model_cold(self) -> bool:
+        """True if the main model isn't in GPU memory yet (after a PC restart it loads from disk)."""
+        if self._loading_since is not None:
+            return True
+        router = self.brain.router
+        try:
+            return not all(self.brain.local.is_loaded(m) for m in {router.model_for("light"), router.model_for("normal")})
+        except Exception:
+            return True
+
+    def _loading_notice(self) -> str:
+        """What to say when a request arrives before the model has finished loading."""
+        if self._loading_since is None:
+            return "One moment, loading the model."
+        left = self.cfg.brain.expected_load_seconds - (time.monotonic() - self._loading_since)
+        if left <= 10:
+            return "The AI is almost loaded. I'll answer in a moment."
+        return f"The AI is still loading, about {int(round(left, -1))} more seconds. I'll answer as soon as it's ready."
 
     def _load_whisper(self) -> None:
         try:
@@ -298,7 +333,8 @@ class App:
             return
         # common commands (time, open app, Chrome profile, volume...) run directly: no AI, near-instant
         with timed("instant command", log):
-            reply = intents.handle(text, self.tools, set(self.cfg.tools.apps))
+            apps = set(self.cfg.tools.apps) | {name.lower() for name, _ in start_menu_apps()}  # every installed app
+            reply = intents.handle(text, self.tools, apps)
         if reply:
             log.info("instant: %r -> %s", text, reply)
             self.say(reply, self._after_answer())
@@ -309,7 +345,7 @@ class App:
             route = self._approve_heavy(route)
         loading = bool(route and not self.brain.local.is_loaded(route.model))
         if loading and not (route.tier == "heavy" and not one_model):
-            self.say("One moment, loading the model.", State.THINKING)
+            self.say(self._loading_notice(), State.THINKING)
         if self.tray and route:
             self.tray.update(State.THINKING, f"{route.model}, {route.tier}")
         self._asking.set()
@@ -421,7 +457,7 @@ class App:
         before = self.sm.state
         self.say(text, before if before in (State.STANDBY, State.ACTIVE) else State.ACTIVE)
 
-    def _ask_aloud(self, prompt: str, wait_seconds: float = 8) -> str:
+    def _ask_aloud(self, prompt: str, wait_seconds: float = 12) -> str:
         """Speak a question and return what you answered ('' if nothing). Called from tools."""
         while not self.confirm_replies.empty():
             self.confirm_replies.get_nowait()
@@ -457,7 +493,7 @@ class App:
 
     def choose(self, question: str, options: dict[str, list[str]]) -> str | None:
         """Ask a question with several answers ("save, don't save, or cancel?"); None if unclear."""
-        reply = self._ask_aloud(question, wait_seconds=10)
+        reply = self._ask_aloud(question, wait_seconds=14)
         choice = pick_option(reply, options)
         log.info("choose %r -> %r -> %s", question, reply, choice)
         return choice
